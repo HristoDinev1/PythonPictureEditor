@@ -5,13 +5,15 @@ from pathlib import Path
 
 import numpy as np
 
+from film_simulation import FilmPreset
 from main import (
-    FilmPreset,
     Settings,
+    add_preset_arguments,
     add_settings_arguments,
     apply_settings,
     list_photo_files,
     load_image,
+    preset_from_args,
     save_image,
     settings_from_args,
 )
@@ -79,14 +81,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--workers", type=int, default=None)
     add_settings_arguments(parser)
+    add_preset_arguments(parser)
     return parser
 
 
 def main() -> None:
     args = _build_arg_parser().parse_args()
     settings = settings_from_args(args)
+    preset = preset_from_args(args)
     paths = list_photo_files(args.source_dir)
-    frames = process_files(paths, settings, args.output_dir, max_workers=args.workers)
+    frames = process_files(
+        paths, settings, args.output_dir, preset=preset, max_workers=args.workers
+    )
     print(f"Wrote {len(frames)} frames to {args.output_dir}")
 
 

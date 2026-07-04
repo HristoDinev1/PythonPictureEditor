@@ -5,6 +5,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from film_simulation import FILM_PRESETS, FilmPreset
+
 LUMA_WEIGHTS: np.ndarray = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
 STANDARD_EXTENSIONS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png"})
@@ -12,15 +14,6 @@ RAW_EXTENSIONS: frozenset[str] = frozenset(
     {".cr2", ".cr3", ".craw", ".nef", ".arw", ".dng", ".raf", ".orf", ".rw2"}
 )
 SUPPORTED_EXTENSIONS: frozenset[str] = STANDARD_EXTENSIONS | RAW_EXTENSIONS
-
-
-@dataclass(frozen=True)
-class FilmPreset:
-    name: str
-    tone_curve: list[list[float]]
-    color_matrix: list[list[float]]
-    grain_amount: float
-    grain_seed: int
 
 
 @dataclass(frozen=True)
@@ -402,19 +395,31 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
     return Settings(**{name: getattr(args, name) for name in SETTINGS_CLI_FIELDS})
 
 
+def add_preset_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--preset", choices=sorted(FILM_PRESETS), default=None)
+
+
+def preset_from_args(args: argparse.Namespace) -> FilmPreset | None:
+    if args.preset is None:
+        return None
+    return FILM_PRESETS[args.preset]
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("input_path", type=Path)
     parser.add_argument("output_path", type=Path)
     add_settings_arguments(parser)
+    add_preset_arguments(parser)
     return parser
 
 
 def main() -> None:
     args = _build_arg_parser().parse_args()
     settings = settings_from_args(args)
+    preset = preset_from_args(args)
     image = load_image(args.input_path)
-    result = apply_settings(image, settings)
+    result = apply_settings(image, settings, preset)
     saved_path = save_image(result, args.output_path)
     print(f"Saved {saved_path}")
 
