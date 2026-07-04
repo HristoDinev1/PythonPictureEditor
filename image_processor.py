@@ -1,22 +1,12 @@
-import argparse
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 
 import numpy as np
 
+import utils
+from main import Settings, apply_settings
 from film_simulation import FilmPreset
-from main import (
-    Settings,
-    add_preset_arguments,
-    add_settings_arguments,
-    apply_settings,
-    list_photo_files,
-    load_image,
-    preset_from_args,
-    save_image,
-    settings_from_args,
-)
 
 FRAME_NAME_TEMPLATE: str = "frame_{index:04d}.png"
 
@@ -49,10 +39,10 @@ def _render_frame(
     output_directory: Path,
 ) -> Path:
     index, source_path = indexed_path
-    image = load_image(source_path)
+    image = utils.load_image(source_path)
     edited = apply_settings(image, settings, preset)
     destination = output_directory / FRAME_NAME_TEMPLATE.format(index=index)
-    return save_image(edited, destination)
+    return utils.save_image(edited, destination)
 
 
 def process_files(
@@ -73,28 +63,3 @@ def process_files(
     )
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         return list(executor.map(worker, enumerate(paths)))
-
-
-def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("source_dir", type=Path)
-    parser.add_argument("output_dir", type=Path)
-    parser.add_argument("--workers", type=int, default=None)
-    add_settings_arguments(parser)
-    add_preset_arguments(parser)
-    return parser
-
-
-def main() -> None:
-    args = _build_arg_parser().parse_args()
-    settings = settings_from_args(args)
-    preset = preset_from_args(args)
-    paths = list_photo_files(args.source_dir)
-    frames = process_files(
-        paths, settings, args.output_dir, preset=preset, max_workers=args.workers
-    )
-    print(f"Wrote {len(frames)} frames to {args.output_dir}")
-
-
-if __name__ == "__main__":
-    main()
