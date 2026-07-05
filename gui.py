@@ -1,3 +1,5 @@
+import ctypes
+import sys
 import threading
 import tkinter as tk
 from dataclasses import fields
@@ -16,6 +18,18 @@ from film_simulation import FilmPreset, load_presets
 PREVIEW_MAX_SIZE: int = 640
 PREVIEW_DEBOUNCE_MS: int = 60
 NO_PRESET_LABEL: str = "None"
+
+MIDNIGHT_BG: str = "#1c1e21"
+MIDNIGHT_PANEL: str = "#25272b"
+MIDNIGHT_BORDER: str = "#333539"
+MIDNIGHT_TROUGH: str = "#2a2c30"
+MIDNIGHT_ACCENT: str = "#3d76ac"
+MIDNIGHT_ACCENT_ACTIVE: str = "#4c89c2"
+MIDNIGHT_FG: str = "#c2c4c8"
+MIDNIGHT_MUTED_FG: str = "#7c7e83"
+MIDNIGHT_BUTTON_BG: str = "#3c3f45"
+MIDNIGHT_BUTTON_HOVER: str = "#484b52"
+MIDNIGHT_BUTTON_PRESSED: str = "#33363b"
 SLIDER_GROUPS: dict[str, list[tuple[str, str]]] = {
     "Light": [
         ("Exposure", "exposure"),
@@ -38,7 +52,7 @@ SLIDER_GROUPS: dict[str, list[tuple[str, str]]] = {
         ("Vignette", "vignette"),
     ],
     "Detail": [
-        ("Noise Reduction (Lum)", "noise_reduction_luminance"),
+        ("Noise Reduction", "noise_reduction_luminance"),
         ("Noise Reduction (Color)", "noise_reduction_color"),
     ],
 }
@@ -56,17 +70,116 @@ def downscale_for_preview(image: np.ndarray, max_size: int) -> np.ndarray:
 class PhotoEditorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Batch Photo Editor + Timelapse")
+        self.root.title("Darkroom")
         self.photo_paths: list[Path] = []
         self.preview_base: np.ndarray | None = None
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.presets: dict[str, FilmPreset] = load_presets()
         self.slider_variables: dict[str, tk.DoubleVar] = {}
         self.preset_variable = tk.StringVar(value=NO_PRESET_LABEL)
-        self.status_variable = tk.StringVar(value="Load a folder to begin")
+        self.status_variable = tk.StringVar(value='"Darkroom"')
         self.render_generation = 0
         self.pending_render: str | None = None
+        self._apply_midnight_theme()
         self._build_layout()
+        self._apply_dark_titlebar()
+
+    def _apply_dark_titlebar(self) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            self.root.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            enabled = ctypes.c_int(1)
+            for attribute in (20, 19):
+                result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attribute, ctypes.byref(enabled), ctypes.sizeof(enabled)
+                )
+                if result == 0:
+                    break
+        except OSError:
+            pass
+
+    def _apply_midnight_theme(self) -> None:
+        self.root.configure(bg=MIDNIGHT_BG)
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+
+        style.configure(
+            "TFrame", background=MIDNIGHT_BG, borderwidth=0
+        )
+        style.configure(
+            "TLabel", background=MIDNIGHT_BG, foreground=MIDNIGHT_FG
+        )
+        style.configure(
+            "TLabelframe",
+            background=MIDNIGHT_BG,
+            bordercolor=MIDNIGHT_BORDER,
+            relief="solid",
+        )
+        style.configure(
+            "TLabelframe.Label",
+            background=MIDNIGHT_BG,
+            foreground=MIDNIGHT_ACCENT_ACTIVE,
+        )
+        style.configure(
+            "TButton",
+            background=MIDNIGHT_BUTTON_BG,
+            foreground=MIDNIGHT_FG,
+            bordercolor=MIDNIGHT_BUTTON_BG,
+            lightcolor=MIDNIGHT_BUTTON_BG,
+            darkcolor=MIDNIGHT_BUTTON_BG,
+            focuscolor=MIDNIGHT_BUTTON_BG,
+            relief="flat",
+            padding=6,
+        )
+        style.map(
+            "TButton",
+            background=[("active", MIDNIGHT_BUTTON_HOVER), ("pressed", MIDNIGHT_BUTTON_PRESSED)],
+            lightcolor=[("active", MIDNIGHT_BUTTON_HOVER), ("pressed", MIDNIGHT_BUTTON_PRESSED)],
+            darkcolor=[("active", MIDNIGHT_BUTTON_HOVER), ("pressed", MIDNIGHT_BUTTON_PRESSED)],
+            bordercolor=[("active", MIDNIGHT_BUTTON_HOVER), ("pressed", MIDNIGHT_BUTTON_PRESSED)],
+        )
+        style.configure(
+            "Horizontal.TScale",
+            background=MIDNIGHT_BG,
+            troughcolor=MIDNIGHT_TROUGH,
+            bordercolor=MIDNIGHT_BG,
+            lightcolor=MIDNIGHT_ACCENT,
+            darkcolor=MIDNIGHT_ACCENT,
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground=MIDNIGHT_PANEL,
+            background=MIDNIGHT_PANEL,
+            foreground=MIDNIGHT_FG,
+            arrowcolor=MIDNIGHT_FG,
+            bordercolor=MIDNIGHT_BORDER,
+            lightcolor=MIDNIGHT_PANEL,
+            darkcolor=MIDNIGHT_PANEL,
+            insertcolor=MIDNIGHT_FG,
+            padding=4,
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", MIDNIGHT_PANEL)],
+            foreground=[("readonly", MIDNIGHT_FG)],
+            selectbackground=[("readonly", MIDNIGHT_PANEL)],
+            selectforeground=[("readonly", MIDNIGHT_FG)],
+            background=[("active", MIDNIGHT_PANEL), ("readonly", MIDNIGHT_PANEL)],
+            bordercolor=[("focus", MIDNIGHT_ACCENT), ("readonly", MIDNIGHT_BORDER)],
+            lightcolor=[("focus", MIDNIGHT_PANEL), ("readonly", MIDNIGHT_PANEL)],
+            darkcolor=[("focus", MIDNIGHT_PANEL), ("readonly", MIDNIGHT_PANEL)],
+            arrowcolor=[("readonly", MIDNIGHT_FG)],
+        )
+        self.root.option_add("*TCombobox*Listbox.background", MIDNIGHT_PANEL)
+        self.root.option_add("*TCombobox*Listbox.foreground", MIDNIGHT_FG)
+        self.root.option_add(
+            "*TCombobox*Listbox.selectBackground", MIDNIGHT_ACCENT
+        )
+        self.root.option_add(
+            "*TCombobox*Listbox.selectForeground", "#e8e9eb"
+        )
 
     def _build_layout(self) -> None:
         left = ttk.Frame(self.root, padding=4)
@@ -82,20 +195,31 @@ class PhotoEditorApp:
 
         ttk.Button(left, text="Load Image…", command=self.load_image).pack(fill="x")
         ttk.Button(left, text="Load Folder…", command=self.load_folder).pack(fill="x")
-        self.photo_list = tk.Listbox(left, width=32)
+        self.photo_list = tk.Listbox(
+            left,
+            width=32,
+            background=MIDNIGHT_PANEL,
+            foreground=MIDNIGHT_FG,
+            selectbackground=MIDNIGHT_ACCENT,
+            selectforeground="#e8e9eb",
+            highlightbackground=MIDNIGHT_BORDER,
+            highlightcolor=MIDNIGHT_ACCENT,
+            borderwidth=0,
+            relief="flat",
+        )
         self.photo_list.pack(fill="both", expand=True)
         self.photo_list.bind("<<ListboxSelect>>", self._on_photo_selected)
 
-        self.preview_label = ttk.Label(middle, anchor="center")
+        self.preview_label = ttk.Label(middle, anchor="center", background=MIDNIGHT_PANEL)
         self.preview_label.pack(fill="both", expand=True)
 
         for group_name, entries in SLIDER_GROUPS.items():
-            frame = ttk.LabelFrame(right, text=group_name, padding=2)
-            frame.pack(fill="x", pady=2)
+            frame = ttk.LabelFrame(right, text=group_name, padding=8)
+            frame.pack(fill="x", pady=10)
             for label, field_name in entries:
                 self._add_slider(frame, label, field_name)
-        preset_frame = ttk.LabelFrame(right, text="Film Simulation", padding=2)
-        preset_frame.pack(fill="x", pady=2)
+        preset_frame = ttk.LabelFrame(right, text="Film Simulation", padding=8)
+        preset_frame.pack(fill="x", pady=10)
         preset_box = ttk.Combobox(
             preset_frame,
             textvariable=self.preset_variable,
@@ -111,13 +235,12 @@ class PhotoEditorApp:
         ttk.Button(bottom, text="Export Timelapse", command=self.export_timelapse).pack(
             side="left", padx=4
         )
-        ttk.Label(bottom, textvariable=self.status_variable).pack(side="left", padx=8)
 
     def _add_slider(self, parent: ttk.LabelFrame, label: str, field_name: str) -> None:
         variable = tk.DoubleVar(value=0.0)
         self.slider_variables[field_name] = variable
         row = ttk.Frame(parent)
-        row.pack(fill="x")
+        row.pack(fill="x", pady=4)
         ttk.Label(row, text=label, width=22).pack(side="left")
         scale = ttk.Scale(
             row,
