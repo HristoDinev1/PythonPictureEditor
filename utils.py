@@ -28,7 +28,7 @@ def _load_raw_image(path: Path) -> np.ndarray:
     import rawpy
 
     with rawpy.imread(str(path)) as raw:
-        rgb = raw.postprocess()
+        rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True)
     return rgb.astype(np.float32) / 255.0
 
 
@@ -47,6 +47,13 @@ def load_image(path: Path) -> np.ndarray:
 def to_pil_image(image: np.ndarray) -> Image.Image:
     eight_bit = (np.clip(image, 0.0, 1.0) * 255.0).round().astype(np.uint8)
     return Image.fromarray(eight_bit, mode="RGB")
+
+
+def resize_image(image: np.ndarray, height: int, width: int) -> np.ndarray:
+    if image.shape[0] == height and image.shape[1] == width:
+        return image
+    resized = to_pil_image(image).resize((width, height), Image.LANCZOS)
+    return np.asarray(resized, dtype=np.float32) / 255.0
 
 
 def save_image(image: np.ndarray, path: Path) -> Path:

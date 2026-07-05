@@ -2,6 +2,11 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+try:
+    from scipy.ndimage import minimum_filter as _scipy_minimum_filter
+except ImportError:
+    _scipy_minimum_filter = None
+
 from film_simulation import FilmPreset
 
 LUMA_WEIGHTS: np.ndarray = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
@@ -10,6 +15,7 @@ LUMA_WEIGHTS: np.ndarray = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 @dataclass(frozen=True)
 class Settings:
     exposure: float = 0.0
+    brightness: float = 0.0
     contrast: float = 0.0
     highlights: float = 0.0
     shadows: float = 0.0
@@ -22,14 +28,24 @@ class Settings:
     texture: float = 0.0
     clarity: float = 0.0
     dehaze: float = 0.0
+    milky_way_glow: float = 0.0
     vignette: float = 0.0
+    sharpness: float = 0.0
     noise_reduction_luminance: float = 0.0
     noise_reduction_color: float = 0.0
+    rotation: int = 0
     film_simulation: str = field(default="None")
 
 
 def clip_unit(image: np.ndarray) -> np.ndarray:
     return np.clip(image, 0.0, 1.0)
+
+
+def apply_rotation(image: np.ndarray, degrees: int) -> np.ndarray:
+    if degrees % 360 == 0:
+        return image
+    steps = (-degrees // 90) % 4
+    return np.ascontiguousarray(np.rot90(image, k=steps))
 
 
 def luminance(image: np.ndarray) -> np.ndarray:
@@ -68,44 +84,102 @@ def box_blur(image: np.ndarray, radius: int) -> np.ndarray:
     return _box_blur_axis(blurred, radius, axis=1)
 
 
-def adjust_exposure(image: np.ndarray, amount: float) -> np.ndarray:
+def _min_filter_axis(values: np.ndarray, radius: int, axis: int) -> np.ndarray:
+    pad_width = [
+        (radius, radius) if index == axis else (0, 0) for index in range(values.ndim)
+    ]
+    padded = np.pad(values, pad_width, mode="edge")
+    result: np.ndarray | None = None
+    for shift in range(2 * radius + 1):
+        window = np.take(
+            padded, range(shift, shift + values.shape[axis]), axis=axis
+        )
+        result = window if result is None else np.minimum(result, window)
+    assert result is not None
+    return result
+
+
+def min_filter(values: np.ndarray, radius: int) -> np.ndarray:
+    if radius <= 0:
+        return values
+    if _scipy_minimum_filter is not None:
+        return _scipy_minimum_filter(values, size=2 * radius + 1, mode="nearest")
+    return _min_filter_axis(_min_filter_axis(values, radius, 0), radius, 1)
+
+
+def adjust_exposure(image: np.ndarray, stops: float) -> np.ndarray:
+    if stops == 0.0:
+        return image
+    return clip_unit(image * float(2.0**stops))
+
+
+def adjust_brightness(image: np.ndarray, amount: float) -> np.ndarray:
     if amount == 0.0:
         return image
-    return clip_unit(image * float(2.0 ** (2.0 * amount)))
+    gamma = 2.0 ** (-amount)
+    return clip_unit(np.power(np.clip(image, 0.0, 1.0), gamma))
 
 
 def adjust_contrast(image: np.ndarray, amount: float) -> np.ndarray:
     if amount == 0.0:
         return image
-    return clip_unit((image - 0.5) * (1.0 + amount) + 0.5)
+    return clip_unit((image - 0.5) * float(2.0**amount) + 0.5)
 
 
-def _tonal_shift(image: np.ndarray, amount: float, weight: np.ndarray) -> np.ndarray:
-    return clip_unit(image + 0.5 * amount * weight[..., None])
+def _tonal_shift(
+    image: np.ndarray,
+    amount: float,
+    edge_low: float,
+    edge_high: float,
+    invert: bool = False,
+    min_width: float = 0.0,
+) -> np.ndarray:
+    weight = smoothstep(luminance(image), edge_low, edge_high)
+    if invert:
+        weight = 1.0 - weight
+    # Capping max_delta at (window / 3) is what keeps this monotonic (see below),
+    # but a window derived from this image's own percentiles can be much narrower
+    # than the window a fixed threshold would use -- min_width keeps the *delta*
+    # from collapsing to near-nothing just because the matching pixels happen to
+    # be clustered close together, without changing which pixels are targeted.
+    width = max(edge_high - edge_low, min_width)
+    max_delta = width / 3.0
+    return clip_unit(image + max_delta * amount * weight[..., None])
 
 
 def adjust_highlights(image: np.ndarray, amount: float) -> np.ndarray:
     if amount == 0.0:
         return image
-    return _tonal_shift(image, amount, smoothstep(luminance(image), 0.5, 1.0))
+    return _tonal_shift(image, amount, 0.15, 1.0)
 
 
 def adjust_shadows(image: np.ndarray, amount: float) -> np.ndarray:
     if amount == 0.0:
         return image
-    return _tonal_shift(image, amount, 1.0 - smoothstep(luminance(image), 0.0, 0.5))
+    return _tonal_shift(image, amount, 0.0, 0.5, invert=True)
 
 
 def adjust_whites(image: np.ndarray, amount: float) -> np.ndarray:
     if amount == 0.0:
         return image
-    return _tonal_shift(image, amount, smoothstep(luminance(image), 0.75, 1.0))
+    # Fixed at 0.75..1.0, this never touched anything on a photo whose brightest
+    # content (e.g. a night sky's stars) never reaches that range -- the slider
+    # would look like it did nothing. Anchoring the window to this image's own
+    # brightest percentiles instead means it always has real content to act on;
+    # min_width keeps the effect visible even when that content is clustered in
+    # a narrow band, which is exactly the case on a low-dynamic-range photo.
+    gray = luminance(image)
+    edge_high = float(np.percentile(gray, 99.5))
+    edge_low = float(np.percentile(gray, 85.0))
+    if edge_high <= edge_low:
+        edge_high = edge_low + 1e-6
+    return _tonal_shift(image, amount, edge_low, edge_high, min_width=0.15)
 
 
 def adjust_blacks(image: np.ndarray, amount: float) -> np.ndarray:
     if amount == 0.0:
         return image
-    return _tonal_shift(image, amount, 1.0 - smoothstep(luminance(image), 0.0, 0.25))
+    return _tonal_shift(image, amount, 0.0, 0.25, invert=True)
 
 
 def adjust_temperature(image: np.ndarray, amount: float) -> np.ndarray:
@@ -148,6 +222,12 @@ def _local_contrast(image: np.ndarray, amount: float, radius: int) -> np.ndarray
     return clip_unit(image + amount * detail)
 
 
+def adjust_sharpness(image: np.ndarray, amount: float) -> np.ndarray:
+    if amount == 0.0:
+        return image
+    return _local_contrast(image, 2.0 * amount, radius=1)
+
+
 def adjust_texture(image: np.ndarray, amount: float) -> np.ndarray:
     if amount == 0.0:
         return image
@@ -161,53 +241,56 @@ def adjust_clarity(image: np.ndarray, amount: float) -> np.ndarray:
     return _local_contrast(image, amount, radius)
 
 
-def tiled_equalize(gray: np.ndarray, tiles: int = 8, bins: int = 256) -> np.ndarray:
-    height, width = gray.shape
-    grid = min(tiles, height, width)
-    levels = np.clip((gray * (bins - 1)).astype(np.int64), 0, bins - 1)
-    row_edges = np.linspace(0, height, grid + 1).astype(np.int64)
-    col_edges = np.linspace(0, width, grid + 1).astype(np.int64)
-    lookup_tables = np.zeros((grid, grid, bins), dtype=np.float64)
-    for row in range(grid):
-        for col in range(grid):
-            tile = levels[
-                row_edges[row] : row_edges[row + 1],
-                col_edges[col] : col_edges[col + 1],
-            ]
-            histogram = np.bincount(tile.ravel(), minlength=bins)
-            cumulative = np.cumsum(histogram).astype(np.float64)
-            lookup_tables[row, col] = cumulative / max(cumulative[-1], 1.0)
-    tile_height = height / grid
-    tile_width = width / grid
-    row_positions = np.clip(
-        (np.arange(height) + 0.5) / tile_height - 0.5, 0.0, grid - 1.0
-    )
-    col_positions = np.clip(
-        (np.arange(width) + 0.5) / tile_width - 0.5, 0.0, grid - 1.0
-    )
-    row_low = row_positions.astype(np.int64)[:, None]
-    col_low = col_positions.astype(np.int64)[None, :]
-    row_high = np.minimum(row_low + 1, grid - 1)
-    col_high = np.minimum(col_low + 1, grid - 1)
-    row_frac = (row_positions[:, None] - row_low).astype(np.float64)
-    col_frac = (col_positions[None, :] - col_low).astype(np.float64)
-    top = (1.0 - col_frac) * lookup_tables[row_low, col_low, levels] + (
-        col_frac * lookup_tables[row_low, col_high, levels]
-    )
-    bottom = (1.0 - col_frac) * lookup_tables[row_high, col_low, levels] + (
-        col_frac * lookup_tables[row_high, col_high, levels]
-    )
-    return ((1.0 - row_frac) * top + row_frac * bottom).astype(np.float32)
+HAZE_VEIL: np.ndarray = np.array([0.8, 0.82, 0.85], dtype=np.float32)
+
+
+def _dehaze_radius(image: np.ndarray) -> int:
+    return max(1, min(image.shape[0], image.shape[1]) // 40)
+
+
+def _remove_haze(image: np.ndarray, amount: float) -> np.ndarray:
+    radius = _dehaze_radius(image)
+    dark_channel = min_filter(image.min(axis=-1), radius)
+    flat = dark_channel.ravel()
+    sample = max(1, flat.size // 1000)
+    haziest = np.argpartition(flat, -sample)[-sample:]
+    airlight = image.reshape(-1, 3)[haziest].mean(axis=0)
+    airlight = np.clip(airlight, 0.15, 1.0)
+    normalized = min_filter((image / airlight).min(axis=-1), radius)
+    transmission = np.maximum(1.0 - 0.95 * amount * normalized, 0.1)
+    recovered = (image - airlight) / transmission[..., None] + airlight
+    return clip_unit(recovered)
+
+
+def _add_haze(image: np.ndarray, amount: float) -> np.ndarray:
+    transmission = 1.0 - 0.6 * amount
+    return clip_unit(image * transmission + HAZE_VEIL * (1.0 - transmission))
 
 
 def adjust_dehaze(image: np.ndarray, amount: float) -> np.ndarray:
     if amount == 0.0:
         return image
+    if amount > 0.0:
+        return _remove_haze(image, amount)
+    return _add_haze(image, -amount)
+
+
+MILKY_WAY_GLOW_RADIUS_DIVISOR: int = 24
+MILKY_WAY_GLOW_STRENGTH: float = 2.0
+
+
+def adjust_milky_way_glow(image: np.ndarray, amount: float) -> np.ndarray:
+    if amount == 0.0:
+        return image
     gray = luminance(image)
-    target = tiled_equalize(gray) if amount > 0.0 else box_blur(gray, radius=8)
-    blended = gray + abs(amount) * (target - gray)
-    ratio = blended / np.maximum(gray, 1e-6)
-    return clip_unit(image * ratio[..., None])
+    radius = max(4, min(image.shape[0], image.shape[1]) // MILKY_WAY_GLOW_RADIUS_DIVISOR)
+    local_average = box_blur(gray, radius)
+    baseline = np.percentile(local_average, 20)
+    structure = local_average - baseline
+    high = np.percentile(structure, 99)
+    weight = smoothstep(structure, 0.0, max(float(high), 1e-6))
+    boost = 1.0 + weight * amount * MILKY_WAY_GLOW_STRENGTH
+    return clip_unit(image * boost[..., None])
 
 
 def adjust_vignette(image: np.ndarray, amount: float) -> np.ndarray:
@@ -226,16 +309,17 @@ def reduce_luminance_noise(image: np.ndarray, amount: float) -> np.ndarray:
         return image
     gray = luminance(image)
     smoothed = gray + amount * (box_blur(gray, radius=2) - gray)
-    ratio = smoothed / np.maximum(gray, 1e-6)
-    return clip_unit(image * ratio[..., None])
+    delta = smoothed - gray
+    return clip_unit(image + delta[..., None])
 
 
 def reduce_color_noise(image: np.ndarray, amount: float) -> np.ndarray:
     if amount == 0.0:
         return image
+    radius = max(3, min(image.shape[0], image.shape[1]) // 400)
     gray = luminance(image)[..., None]
     chroma = image - gray
-    smoothed_chroma = chroma + amount * (box_blur(chroma, radius=3) - chroma)
+    smoothed_chroma = chroma + amount * (box_blur(chroma, radius) - chroma)
     return clip_unit(gray + smoothed_chroma)
 
 
@@ -270,7 +354,7 @@ def apply_settings(
     scaled = {
         name: getattr(settings, name) / 100.0
         for name in (
-            "exposure",
+            "brightness",
             "contrast",
             "highlights",
             "shadows",
@@ -283,13 +367,16 @@ def apply_settings(
             "texture",
             "clarity",
             "dehaze",
+            "milky_way_glow",
             "vignette",
+            "sharpness",
             "noise_reduction_luminance",
             "noise_reduction_color",
         )
     }
-    result = image.astype(np.float32)
-    result = adjust_exposure(result, scaled["exposure"])
+    result = apply_rotation(image.astype(np.float32), settings.rotation)
+    result = adjust_exposure(result, settings.exposure)
+    result = adjust_brightness(result, scaled["brightness"])
     result = adjust_temperature(result, scaled["temperature"])
     result = adjust_tint(result, scaled["tint"])
     result = adjust_contrast(result, scaled["contrast"])
@@ -302,8 +389,10 @@ def apply_settings(
     result = adjust_texture(result, scaled["texture"])
     result = adjust_clarity(result, scaled["clarity"])
     result = adjust_dehaze(result, scaled["dehaze"])
+    result = adjust_milky_way_glow(result, scaled["milky_way_glow"])
     result = reduce_luminance_noise(result, scaled["noise_reduction_luminance"])
     result = reduce_color_noise(result, scaled["noise_reduction_color"])
+    result = adjust_sharpness(result, scaled["sharpness"])
     result = adjust_vignette(result, scaled["vignette"])
     if preset is not None:
         result = apply_film_preset(result, preset)

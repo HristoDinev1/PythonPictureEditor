@@ -7,7 +7,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
-from PIL import ImageTk
+from PIL import Image, ImageTk
 
 import image_processor
 import utils
@@ -15,7 +15,7 @@ import timelapse
 from main import Settings, apply_settings
 from film_simulation import FilmPreset, load_presets
 
-PREVIEW_MAX_SIZE: int = 640
+PREVIEW_MAX_SIZE: int = 1100
 PREVIEW_DEBOUNCE_MS: int = 60
 NO_PRESET_LABEL: str = "None"
 
@@ -30,9 +30,18 @@ MIDNIGHT_MUTED_FG: str = "#7c7e83"
 MIDNIGHT_BUTTON_BG: str = "#3c3f45"
 MIDNIGHT_BUTTON_HOVER: str = "#484b52"
 MIDNIGHT_BUTTON_PRESSED: str = "#33363b"
+
+DEFAULT_SLIDER_RANGE: tuple[float, float, int] = (-100.0, 100.0, 0)
+SLIDER_RANGES: dict[str, tuple[float, float, int]] = {
+    "exposure": (-5.0, 5.0, 1),
+    "sharpness": (0.0, 150.0, 0),
+    "noise_reduction_luminance": (0.0, 100.0, 0),
+    "noise_reduction_color": (0.0, 100.0, 0),
+}
 SLIDER_GROUPS: dict[str, list[tuple[str, str]]] = {
     "Light": [
         ("Exposure", "exposure"),
+        ("Brightness", "brightness"),
         ("Contrast", "contrast"),
         ("Highlights", "highlights"),
         ("Shadows", "shadows"),
@@ -49,12 +58,20 @@ SLIDER_GROUPS: dict[str, list[tuple[str, str]]] = {
         ("Texture", "texture"),
         ("Clarity", "clarity"),
         ("Dehaze", "dehaze"),
+        ("Milky Way Glow", "milky_way_glow"),
         ("Vignette", "vignette"),
     ],
     "Detail": [
+        ("Sharpness", "sharpness"),
         ("Noise Reduction", "noise_reduction_luminance"),
         ("Noise Reduction (Color)", "noise_reduction_color"),
     ],
+}
+TIMELAPSE_FPS: int = 24
+TIMELAPSE_MODE_LABELS: dict[str, str] = {
+    "Standard Time-Lapse": timelapse.MODE_STANDARD,
+    "Hyperlapse": timelapse.MODE_HYPERLAPSE,
+    "Long-Exposure Time-Lapse": timelapse.MODE_LONG_EXPOSURE,
 }
 
 
@@ -67,17 +84,43 @@ def downscale_for_preview(image: np.ndarray, max_size: int) -> np.ndarray:
     return np.ascontiguousarray(image[::step, ::step])
 
 
+def fit_within_box(image: Image.Image, max_width: int, max_height: int) -> Image.Image:
+    if max_width <= 1 or max_height <= 1:
+        return image
+    scale = min(max_width / image.width, max_height / image.height, 1.0)
+    if scale >= 1.0:
+        return image
+    size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+    return image.resize(size, Image.LANCZOS)
+
+
 class PhotoEditorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Darkroom")
+        self.root.geometry("1600x1000")
+        self.root.minsize(1100, 700)
         self.photo_paths: list[Path] = []
         self.preview_base: np.ndarray | None = None
         self.preview_photo: ImageTk.PhotoImage | None = None
+        self.last_rendered_image: Image.Image | None = None
+        self.pending_resize: str | None = None
         self.presets: dict[str, FilmPreset] = load_presets()
         self.slider_variables: dict[str, tk.DoubleVar] = {}
+        self.slider_decimals: dict[str, int] = {}
+        self.rotation: int = 0
         self.preset_variable = tk.StringVar(value=NO_PRESET_LABEL)
         self.status_variable = tk.StringVar(value='"Darkroom"')
+        self.timelapse_mode_variable = tk.StringVar(
+            value=next(iter(TIMELAPSE_MODE_LABELS))
+        )
+        self.long_exposure_window_variable = tk.IntVar(
+            value=timelapse.DEFAULT_LONG_EXPOSURE_WINDOW
+        )
+        self.timelapse_estimate_variable = tk.StringVar(value="")
+        self.progress_variable = tk.DoubleVar(value=0.0)
+        self.operation_status_variable = tk.StringVar(value="")
+        self.operation_in_progress = False
         self.render_generation = 0
         self.pending_render: str | None = None
         self._apply_midnight_theme()
@@ -210,8 +253,15 @@ class PhotoEditorApp:
         self.photo_list.pack(fill="both", expand=True)
         self.photo_list.bind("<<ListboxSelect>>", self._on_photo_selected)
 
+        preview_toolbar = ttk.Frame(middle)
+        preview_toolbar.pack(fill="x", pady=(0, 4))
+        ttk.Button(preview_toolbar, text="Rotate 90°", command=self.rotate_photo).pack(
+            side="left"
+        )
+
         self.preview_label = ttk.Label(middle, anchor="center", background=MIDNIGHT_PANEL)
-        self.preview_label.pack(fill="both", expand=True)
+        self.preview_label.pack(fill="both", expand=True, pady=12)
+        self.preview_label.bind("<Configure>", lambda event: self._schedule_preview_refit())
 
         for group_name, entries in SLIDER_GROUPS.items():
             frame = ttk.LabelFrame(right, text=group_name, padding=8)
@@ -229,41 +279,151 @@ class PhotoEditorApp:
         preset_box.pack(fill="x")
         preset_box.bind("<<ComboboxSelected>>", lambda event: self.schedule_preview())
 
-        ttk.Button(bottom, text="Apply to All Photos", command=self.apply_to_all).pack(
-            side="left", padx=4
+        self.apply_button = ttk.Button(
+            bottom, text="Apply to All Photos", command=self.apply_to_all
         )
-        ttk.Button(bottom, text="Export Timelapse", command=self.export_timelapse).pack(
-            side="left", padx=4
+        self.apply_button.pack(side="left", padx=4)
+        self.export_button = ttk.Button(
+            bottom, text="Export Timelapse", command=self.export_timelapse
+        )
+        self.export_button.pack(side="left", padx=4)
+
+        self.progress_bar = ttk.Progressbar(
+            bottom, variable=self.progress_variable, maximum=100.0, length=200
+        )
+        self.progress_bar.pack(side="right", padx=(4, 8))
+        ttk.Label(bottom, textvariable=self.operation_status_variable, width=28).pack(
+            side="right", padx=4
+        )
+
+        ttk.Label(bottom, text="Timelapse:").pack(side="left", padx=(16, 4))
+        mode_box = ttk.Combobox(
+            bottom,
+            textvariable=self.timelapse_mode_variable,
+            values=list(TIMELAPSE_MODE_LABELS),
+            state="readonly",
+            width=24,
+        )
+        mode_box.pack(side="left")
+        mode_box.bind("<<ComboboxSelected>>", lambda event: self._on_timelapse_mode_changed())
+
+        ttk.Label(bottom, text="Frames/blend:").pack(side="left", padx=(8, 4))
+        self.long_exposure_spinbox = ttk.Spinbox(
+            bottom,
+            from_=2,
+            to=120,
+            width=4,
+            textvariable=self.long_exposure_window_variable,
+            command=self._update_timelapse_estimate,
+        )
+        self.long_exposure_spinbox.pack(side="left")
+        self.long_exposure_spinbox.bind(
+            "<KeyRelease>", lambda event: self._update_timelapse_estimate()
+        )
+        self.long_exposure_spinbox.configure(state="disabled")
+
+        ttk.Label(bottom, textvariable=self.timelapse_estimate_variable).pack(
+            side="left", padx=(10, 4)
+        )
+        self._update_timelapse_estimate()
+
+    def _on_timelapse_mode_changed(self) -> None:
+        is_long_exposure = (
+            TIMELAPSE_MODE_LABELS[self.timelapse_mode_variable.get()]
+            == timelapse.MODE_LONG_EXPOSURE
+        )
+        self.long_exposure_spinbox.configure(
+            state="normal" if is_long_exposure else "disabled"
+        )
+        self._update_timelapse_estimate()
+
+    def _update_timelapse_estimate(self) -> None:
+        mode = TIMELAPSE_MODE_LABELS[self.timelapse_mode_variable.get()]
+        try:
+            window = max(1, self.long_exposure_window_variable.get())
+        except tk.TclError:
+            window = timelapse.DEFAULT_LONG_EXPOSURE_WINDOW
+        count = len(self.photo_paths)
+        if count == 0:
+            self.timelapse_estimate_variable.set("Load photos to estimate length")
+            return
+        duration = timelapse.estimate_duration_seconds(
+            count, mode, fps=TIMELAPSE_FPS, long_exposure_window=window
+        )
+        self.timelapse_estimate_variable.set(
+            f"~{duration:.1f}s ({count} photo{'s' if count != 1 else ''} @ {TIMELAPSE_FPS}fps)"
         )
 
     def _add_slider(self, parent: ttk.LabelFrame, label: str, field_name: str) -> None:
         variable = tk.DoubleVar(value=0.0)
         self.slider_variables[field_name] = variable
+        lower, upper, decimals = SLIDER_RANGES.get(field_name, DEFAULT_SLIDER_RANGE)
+        self.slider_decimals[field_name] = decimals
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=4)
         ttk.Label(row, text=label, width=22).pack(side="left")
+
+        def format_value(value: float) -> str:
+            text = f"{value:.{decimals}f}"
+            return f"+{text}" if value > 0 else text
+
+        value_text = tk.StringVar(value=format_value(0.0))
+
+        def on_change(value: str) -> None:
+            snapped = round(float(value), decimals)
+            if snapped != variable.get():
+                variable.set(snapped)
+            value_text.set(format_value(snapped))
+            self.schedule_preview()
+
         scale = ttk.Scale(
             row,
-            from_=-100.0,
-            to=100.0,
+            from_=lower,
+            to=upper,
             variable=variable,
-            command=lambda value: self.schedule_preview(),
+            command=on_change,
         )
         scale.pack(side="left", fill="x", expand=True)
+        value_label = ttk.Label(row, textvariable=value_text, width=5, anchor="e")
+        value_label.pack(side="left", padx=(6, 0))
+
+        def reset(_event: tk.Event) -> str:
+            variable.set(0.0)
+            value_text.set(format_value(0.0))
+            self.schedule_preview()
+            return "break"
+
+        scale.bind("<Double-Button-1>", reset)
+        value_label.bind("<Double-Button-1>", reset)
 
     def current_settings(self) -> Settings:
         values = {
-            field.name: self.slider_variables[field.name].get()
+            field.name: round(
+                self.slider_variables[field.name].get(),
+                self.slider_decimals.get(field.name, 0),
+            )
             for field in fields(Settings)
             if field.name in self.slider_variables
         }
-        return Settings(**values, film_simulation=self.preset_variable.get())
+        return Settings(
+            **values,
+            rotation=self.rotation,
+            film_simulation=self.preset_variable.get(),
+        )
 
     def current_preset(self) -> FilmPreset | None:
         return self.presets.get(self.preset_variable.get())
 
+    def rotate_photo(self) -> None:
+        self.rotation = (self.rotation + 90) % 360
+        self.schedule_preview()
+
     def load_image(self) -> None:
-        extensions = " ".join(f"*{ext}" for ext in sorted(utils.SUPPORTED_EXTENSIONS))
+        extensions = " ".join(
+            f"*{case(ext)}"
+            for ext in sorted(utils.SUPPORTED_EXTENSIONS)
+            for case in (str.lower, str.upper)
+        )
         chosen = filedialog.askopenfilename(
             title="Choose a photo",
             filetypes=[("Supported photos", extensions), ("All files", "*.*")],
@@ -276,6 +436,7 @@ class PhotoEditorApp:
         self.status_variable.set(f"Loaded {self.photo_paths[0].name}")
         self.photo_list.selection_set(0)
         self._on_photo_selected(None)
+        self._update_timelapse_estimate()
 
     def load_folder(self) -> None:
         chosen = filedialog.askdirectory(title="Choose a photo folder")
@@ -287,10 +448,12 @@ class PhotoEditorApp:
             self.photo_list.insert(tk.END, path.name)
         if not self.photo_paths:
             self.status_variable.set("Folder contains no supported photos")
+            self._update_timelapse_estimate()
             return
         self.status_variable.set(f"Loaded {len(self.photo_paths)} photos")
         self.photo_list.selection_set(0)
         self._on_photo_selected(None)
+        self._update_timelapse_estimate()
 
     def _on_photo_selected(self, event: tk.Event | None) -> None:
         selection = self.photo_list.curselection()
@@ -337,10 +500,61 @@ class PhotoEditorApp:
     def _show_preview(self, image: np.ndarray, generation: int) -> None:
         if generation != self.render_generation:
             return
-        self.preview_photo = ImageTk.PhotoImage(utils.to_pil_image(image))
+        self.last_rendered_image = utils.to_pil_image(image)
+        self._refresh_preview_display()
+
+    def _refresh_preview_display(self) -> None:
+        if self.last_rendered_image is None:
+            return
+        box_width = self.preview_label.winfo_width()
+        box_height = self.preview_label.winfo_height()
+        fitted = fit_within_box(self.last_rendered_image, box_width, box_height)
+        self.preview_photo = ImageTk.PhotoImage(fitted)
         self.preview_label.configure(image=self.preview_photo)
 
+    def _schedule_preview_refit(self) -> None:
+        if self.pending_resize is not None:
+            self.root.after_cancel(self.pending_resize)
+        self.pending_resize = self.root.after(
+            PREVIEW_DEBOUNCE_MS, self._run_scheduled_refit
+        )
+
+    def _run_scheduled_refit(self) -> None:
+        self.pending_resize = None
+        self._refresh_preview_display()
+
+    def _begin_operation(self, label: str) -> None:
+        self.operation_in_progress = True
+        self.apply_button.configure(state="disabled")
+        self.export_button.configure(state="disabled")
+        self.progress_variable.set(0.0)
+        self.operation_status_variable.set(label)
+
+    def _make_progress_reporter(self, label: str):
+        def report(done: int, total: int) -> None:
+            self.root.after(0, lambda: self._apply_progress(done, total, label))
+
+        return report
+
+    def _apply_progress(self, done: int, total: int, label: str) -> None:
+        percent = (done / total * 100.0) if total else 0.0
+        self.progress_variable.set(percent)
+        self.operation_status_variable.set(f"{label} {done}/{total}…")
+
+    def _finish_operation(self, message: str, is_error: bool = False) -> None:
+        self.operation_in_progress = False
+        self.apply_button.configure(state="normal")
+        self.export_button.configure(state="normal")
+        self.progress_variable.set(0.0 if is_error else 100.0)
+        self.operation_status_variable.set(message)
+        if is_error:
+            messagebox.showerror("Failed", message)
+        else:
+            messagebox.showinfo("Finished", message)
+
     def apply_to_all(self) -> None:
+        if self.operation_in_progress:
+            return
         if not self.photo_paths:
             messagebox.showinfo("Nothing loaded", "Load a folder of photos first")
             return
@@ -350,36 +564,82 @@ class PhotoEditorApp:
         output_directory = Path(chosen)
         settings = self.current_settings()
         preset = self.current_preset()
-        self.status_variable.set("Processing batch…")
+        total = len(self.photo_paths)
+        self._begin_operation(f"Processing 0/{total}…")
+        report = self._make_progress_reporter("Processing")
 
         def run() -> None:
-            frames = image_processor.process_files(
-                self.photo_paths, settings, output_directory, preset
-            )
+            try:
+                frames = image_processor.process_files(
+                    self.photo_paths,
+                    settings,
+                    output_directory,
+                    preset,
+                    progress=report,
+                )
+            except Exception as error:
+                self.root.after(
+                    0,
+                    lambda: self._finish_operation(
+                        f"Batch failed: {error}", is_error=True
+                    ),
+                )
+                return
             self.root.after(
                 0,
-                lambda: self.status_variable.set(
-                    f"Saved {len(frames)} frames to {output_directory}"
+                lambda: self._finish_operation(
+                    f"Saved {len(frames)} photos to {output_directory}"
                 ),
             )
 
         threading.Thread(target=run, daemon=True).start()
 
     def export_timelapse(self) -> None:
-        chosen = filedialog.askdirectory(title="Folder with rendered frames")
+        if self.operation_in_progress:
+            return
+        if not self.photo_paths:
+            messagebox.showinfo("Nothing loaded", "Load photos first")
+            return
+        if not timelapse.ffmpeg_available():
+            messagebox.showerror(
+                "ffmpeg required",
+                "ffmpeg is required to export a timelapse but was not found on PATH.",
+            )
+            return
+        chosen = filedialog.askdirectory(title="Choose where to save the timelapse")
         if not chosen:
             return
-        frames_directory = Path(chosen)
-        frame_paths = sorted(frames_directory.glob("frame_*.png"))
-        if not frame_paths:
-            messagebox.showinfo("No frames", "Apply settings to all photos first")
-            return
-        self.status_variable.set("Exporting timelapse…")
+        output_directory = Path(chosen)
+        settings = self.current_settings()
+        preset = self.current_preset()
+        mode = TIMELAPSE_MODE_LABELS[self.timelapse_mode_variable.get()]
+        window = max(1, self.long_exposure_window_variable.get())
+        total = len(self.photo_paths)
+        self._begin_operation(f"Rendering 0/{total}…")
+        report = self._make_progress_reporter("Rendering")
 
         def run() -> None:
-            output = timelapse.export_timelapse(frame_paths, frames_directory)
+            try:
+                output = timelapse.build_timelapse(
+                    self.photo_paths,
+                    output_directory,
+                    settings,
+                    preset,
+                    mode=mode,
+                    fps=TIMELAPSE_FPS,
+                    long_exposure_window=window,
+                    progress=report,
+                )
+            except Exception as error:
+                self.root.after(
+                    0,
+                    lambda: self._finish_operation(
+                        f"Timelapse failed: {error}", is_error=True
+                    ),
+                )
+                return
             self.root.after(
-                0, lambda: self.status_variable.set(f"Timelapse saved: {output}")
+                0, lambda: self._finish_operation(f"Timelapse saved: {output}")
             )
 
         threading.Thread(target=run, daemon=True).start()
