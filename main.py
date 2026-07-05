@@ -308,3 +308,9 @@ def apply_settings(
     if preset is not None:
         result = apply_film_preset(result, preset)
     return result
+
+
+if __name__ == "__main__":
+    from gui import main as launch_gui
+
+    launch_gui()

@@ -80,6 +80,7 @@ class PhotoEditorApp:
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
 
+        ttk.Button(left, text="Load Image…", command=self.load_image).pack(fill="x")
         ttk.Button(left, text="Load Folder…", command=self.load_folder).pack(fill="x")
         self.photo_list = tk.Listbox(left, width=32)
         self.photo_list.pack(fill="both", expand=True)
@@ -137,6 +138,21 @@ class PhotoEditorApp:
 
     def current_preset(self) -> FilmPreset | None:
         return self.presets.get(self.preset_variable.get())
+
+    def load_image(self) -> None:
+        extensions = " ".join(f"*{ext}" for ext in sorted(utils.SUPPORTED_EXTENSIONS))
+        chosen = filedialog.askopenfilename(
+            title="Choose a photo",
+            filetypes=[("Supported photos", extensions), ("All files", "*.*")],
+        )
+        if not chosen:
+            return
+        self.photo_paths = [Path(chosen)]
+        self.photo_list.delete(0, tk.END)
+        self.photo_list.insert(tk.END, self.photo_paths[0].name)
+        self.status_variable.set(f"Loaded {self.photo_paths[0].name}")
+        self.photo_list.selection_set(0)
+        self._on_photo_selected(None)
 
     def load_folder(self) -> None:
         chosen = filedialog.askdirectory(title="Choose a photo folder")
